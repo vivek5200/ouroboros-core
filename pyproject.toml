@@ -1,0 +1,8 @@
+[project]
+name = "ouroboros-core"
+version = "0.1.0"
+description = "Python/PyTorch diffusion engine for Ouroboros v7.1"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
