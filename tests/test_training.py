@@ -11,13 +11,16 @@ zero-advantage couple producing ~zero parameter change.
 """
 
 import math
+import time
 
 import pytest
 import torch
 
 torch.set_num_threads(1)  # tiny tensors: single-threaded ops are faster here
 
+from src.curriculum_data import make_instance, stage1_batch
 from src.grpo import sample_batch, validate_coupled
+from src.tokenizer import L_MAX
 from src.training import (
     ACTION_DELETE,
     ACTION_EXPAND,
@@ -25,6 +28,7 @@ from src.training import (
     PhantomPolicy,
     grpo_step,
 )
+from src.train_loop import Trainer, expand_position_accuracy
 
 SEED = 20240607
 VOCAB = 64          # vocab_size <= 64 per scaffold budget
@@ -173,3 +177,136 @@ def test_zero_advantage_couples_produce_zero_param_change():
     assert result["advantage_mean"] == 0.0
     assert result["loss"] == pytest.approx(0.0, abs=1e-12)
     assert result["param_delta"] == pytest.approx(0.0, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Stage-1 curriculum: expand-position accuracy + Trainer learning proof
+# ---------------------------------------------------------------------------
+
+TRAIN_SEEDS = stage1_batch(n=128, seed0=2000)  # 128 training instances
+HELDOUT = stage1_batch(n=20, seed0=9000)       # 20 held-out instances
+
+
+def _chance_baseline(dataset) -> float:
+    """Mean uniform baseline: 1 candidate splice site per live slot.
+
+    An [EXPAND] can only be spliced at ``0 <= pos <= logical_len``
+    (``src.tokenizer.insert_masks`` contract), so a fresh, near-uniform
+    policy holds ~1/(logical_len + 1) of the EXPAND mass at the true gap —
+    that is the chance baseline the learning proof doubles. (Normalizing
+    over all L_MAX physical slots instead is unlearnable by construction:
+    the phantom tail never receives gradient, so its mass inflates in
+    lockstep with the gap and the ratio is pinned at 1/L_MAX forever.)
+    """
+    return sum(1.0 / (len(inst["ids"]) + 1) for inst in dataset) / len(dataset)
+
+
+def _stage1_policy(seed: int = SEED) -> PhantomPolicy:
+    """Fresh policy sized for the real tokenizer buffers (l_max = L_MAX)."""
+    torch.manual_seed(seed)
+    return PhantomPolicy(vocab_size=64, d_model=32, n_actions=3, l_max=L_MAX)
+
+
+def _mean_gap_accuracy(policy, dataset) -> float:
+    scores = [expand_position_accuracy(policy, inst) for inst in dataset]
+    return sum(scores) / len(scores)
+
+
+def test_expand_position_accuracy_in_unit_interval_and_deterministic():
+    policy = _stage1_policy()
+    for inst in HELDOUT[:5]:
+        a = expand_position_accuracy(policy, inst)
+        b = expand_position_accuracy(policy, inst)
+        assert 0.0 <= a <= 1.0
+        assert a == b, "accuracy must be a pure function of (policy, instance)"
+
+
+def test_fresh_policy_accuracy_near_chance_over_20_instances():
+    """Relative proof of the near-chance start (init-robust by design).
+
+    An absolute "near chance" bound on a RANDOMLY INITIALIZED policy is
+    inherently flaky — init variance moves the fresh level around. The
+    robust (and stronger) statement: the fresh accuracy on this exact
+    held-out set is strictly less than HALF of what a briefly-trained
+    policy reaches on that same set, i.e. the untrained policy really is
+    at/below chance and training is what lifts it.
+    """
+    torch.manual_seed(SEED)
+    policy = PhantomPolicy(vocab_size=64, d_model=32, n_actions=3, l_max=L_MAX)
+    fresh_acc = _mean_gap_accuracy(policy, HELDOUT)
+
+    Trainer(policy, lr=5e-3, seed=SEED).epoch(
+        stage1_batch(64, seed0=2000), batch_size=8, epochs=2
+    )
+    post_acc = _mean_gap_accuracy(policy, HELDOUT)
+
+    assert 0.0 <= fresh_acc <= 1.0
+    assert fresh_acc < post_acc / 2.0, (
+        f"fresh={fresh_acc:.4f} not below half of post={post_acc:.4f}"
+    )
+
+
+def test_trainer_learning_proof_heldout_accuracy_doubles_chance():
+    """THE learning proof: 128 instances × 3 epochs on held-out data.
+
+    Masked REINFORCE contributes logprob terms ONLY at ``gap_start`` (all
+    other positions contribute exactly zero), each side's reward is
+    ``coupled_reward(True, True, True) == 1.0`` iff its sampled action at
+    the gap was EXPAND else ``0.0``, and evaluation uses seeds disjoint
+    from training (2000+ vs 9000+). Success = post-training mean
+    P(EXPAND at gap_start) more than DOUBLE the fresh-policy level on the
+    same held-out instances (relative proof; also strictly above the
+    uniform 1/(live_len+1) share). Stays far under 30 s on CPU.
+    """
+    t0 = time.perf_counter()
+    policy = _stage1_policy()
+    fresh_acc = _mean_gap_accuracy(policy, HELDOUT)
+    chance = _chance_baseline(HELDOUT)
+
+    trainer = Trainer(policy, lr=5e-3, seed=SEED)
+    metrics = trainer.epoch(TRAIN_SEEDS, batch_size=8, epochs=3)
+
+    post_acc = _mean_gap_accuracy(policy, HELDOUT)
+    elapsed = time.perf_counter() - t0
+    assert math.isfinite(metrics["loss"])
+    assert fresh_acc < post_acc / 2.0, (
+        f"no learning: fresh={fresh_acc:.5f} vs post={post_acc:.5f}"
+    )
+    assert post_acc > chance  # strictly above the uniform share as well
+    assert elapsed < 30.0, f"learning proof too slow: {elapsed:.1f}s"
+
+
+def test_trainer_save_load_round_trip_restores_identical_accuracy():
+    policy = _stage1_policy()
+    trainer = Trainer(policy, lr=1e-3, seed=SEED)
+    trainer.epoch(TRAIN_SEEDS[:16], batch_size=8, epochs=1)
+    before = [expand_position_accuracy(policy, inst) for inst in HELDOUT[:10]]
+
+    import tempfile
+    import os
+
+    fd, path = tempfile.mkstemp(suffix=".pt")
+    os.close(fd)
+    try:
+        trainer.save(path)
+        revived = Trainer.load(path)
+        after = [
+            expand_position_accuracy(revived.policy, inst) for inst in HELDOUT[:10]
+        ]
+    finally:
+        os.unlink(path)
+    assert after == before  # bit-identical accuracy after round-trip
+
+
+def test_trainer_epoch_metrics_are_plain_floats():
+    trainer = Trainer(_stage1_policy(), lr=1e-3, seed=0)
+    metrics = trainer.epoch(stage1_batch(4, seed0=0), batch_size=2, epochs=1)
+    assert {"loss", "advantage_mean"} <= set(metrics)
+    for key in ("loss", "advantage_mean"):
+        assert type(metrics[key]) is float
+        assert math.isfinite(metrics[key])
+
+
+def test_trainer_rejects_empty_dataset():
+    with pytest.raises(ValueError):
+        Trainer(_stage1_policy()).epoch([])
