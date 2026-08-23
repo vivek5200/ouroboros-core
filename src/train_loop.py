@@ -549,3 +549,22 @@ class Trainer:
         head = PlacementHead(**head_cfg)
         head.load_state_dict(blob["placement_head_state"])
         return cls(policy, lr=cfg["lr"], seed=cfg["seed"], placement_head=head)
+
+    # ------------------------------------------------------------------
+    # Checkpoint-completeness aliases: BOTH state dicts ride together
+    # ------------------------------------------------------------------
+
+    def save_all(self, path: str) -> None:
+        """Alias of :meth:`save` under the explicit completeness name.
+
+        ``save``/``load`` already round-trip ``policy.state_dict()`` AND
+        ``placement_head.state_dict()`` (plus constructor config) in one
+        blob; ``save_all``/``load_all`` expose that guarantee under names
+        that say so — checkpoint helpers always restore identical accuracy.
+        """
+        self.save(path)
+
+    @classmethod
+    def load_all(cls, path: str) -> "Trainer":
+        """Alias of :meth:`load`: rebuild Trainer + policy + placement head."""
+        return cls.load(path)

@@ -39,6 +39,20 @@ Documented semantic decisions (locked by tests/test_diffusion.py):
   ``(l_max, A)`` with one row per buffer position (row ``i`` scores position
   ``i``, evaluated on the step-start buffer). Any other leading size raises
   ``ValueError``.
+* Placement-head integration (optional ``placement_head=``): when attached,
+  WHICH site an EXPAND splices at is decided by the learned head instead of
+  "at the masked position that chose EXPAND". Whether to expand at all, and
+  every KEEP/DELETE decision, still come from the policy's action logits as
+  before. For each EXECUTED expansion the loop builds the head's placement
+  distribution over the candidate splice sites ``0..logical_len`` (the same
+  competition :func:`src.train_loop._placement_probs` scores) on the CURRENT
+  buffer and splices at its ``argmax`` — deterministic; stochastic sampling
+  of the site is a documented future knob. The head is consulted once per
+  executed EXPAND (degraded EXPANDs never reach it), so later expansions in
+  one step see the geometry updated by earlier ones. The head consumes
+  embeddings, so the policy must expose ``embed(ids)`` (a real
+  ``PhantomPolicy`` does); the sanitized sentinel-free view feeds it. With
+  ``placement_head=None`` (default) the legacy behaviour is bit-for-bit.
 * Snapshot indexing: masked positions are snapshotted at step start and
   processed ascending; a shift counter tracks insertions (+1) and deletions
   (-1) so each snapshotted MASK is acted on exactly once at its CURRENT
@@ -110,17 +124,43 @@ class PhantomLoop:
             (``insert_masks`` / ``logical_delete`` / ``front_pack``) hardcode
             L_MAX internally, so any other value would silently corrupt the
             phantom tail. Divergent values raise ``ValueError``.
+        placement_head: Optional trained :class:`src.train_loop.PlacementHead`.
+            When given, the site of each executed [EXPAND] is the ``argmax``
+            of the head's placement distribution over candidate sites
+            ``0..logical_len`` (deterministic; stochastic selection is a
+            future knob). KEEP/DELETE decisions still come from the policy's
+            action logits. Because the head scores embedding-derived site
+            features, the policy must expose ``embed(ids)``; anything else
+            raises ``TypeError`` at construction.
     """
 
-    def __init__(self, policy, vocab_size: int = 64, l_max: int = L_MAX) -> None:
+    def __init__(
+        self, policy, vocab_size: int = 64, l_max: int = L_MAX,
+        placement_head=None,
+    ) -> None:
         if l_max != L_MAX:
             raise ValueError(
                 f"l_max must equal tokenizer.L_MAX ({L_MAX}); the splice"
                 f" primitives hardcode it, got {l_max}"
             )
+        if placement_head is not None:
+            if not callable(getattr(policy, "embed", None)):
+                raise TypeError(
+                    "placement_head requires a policy exposing embed(ids) "
+                    "(e.g. PhantomPolicy): the head scores candidate sites "
+                    "from per-position embeddings"
+                )
+            head_d = getattr(placement_head, "d_model", None)
+            policy_d = getattr(policy, "d_model", None)
+            if head_d is not None and policy_d is not None and head_d != policy_d:
+                raise ValueError(
+                    f"placement_head d_model {head_d} != policy d_model "
+                    f"{policy_d}"
+                )
         self.policy = policy
         self.vocab_size = vocab_size
         self.l_max = l_max
+        self.placement_head = placement_head
         self.buffer: list[int] | None = None
         self.logical_len: int = 0
 
@@ -149,6 +189,11 @@ class PhantomLoop:
         Args:
             max_expand: Maximum [EXPAND] operations permitted within THIS
                 step; further EXPAND decisions degrade to KEEP.
+
+        With ``placement_head`` attached (see ``__init__``), each EXECUTED
+        expansion splices at the head's argmax site over candidate sites
+        ``0..logical_len`` instead of at the masked position that chose
+        EXPAND; degraded expansions never consult the head.
 
         Returns:
             :class:`DiffusionStep` recording action counts and logical
@@ -187,6 +232,13 @@ class PhantomLoop:
 
             if action == ACTION_EXPAND:
                 if expands < max_expand and self.logical_len < self.l_max:
+                    if self.placement_head is not None:
+                        # Head-driven integration: the splice lands at the
+                        # head's argmax site on the CURRENT buffer (site
+                        # coordinates are live, so no shift translation is
+                        # needed); the snapshotted mask's own position stays
+                        # irrelevant to WHERE the fresh boundary appears.
+                        pos = self._expand_site()
                     # Fresh MASK boundary at pos; old MASK slides right.
                     self.logical_len = insert_masks(
                         self.buffer, self.logical_len, pos, 1
@@ -227,6 +279,30 @@ class PhantomLoop:
     def _require_started(self) -> None:
         if self.buffer is None:
             raise RuntimeError("PhantomLoop.start() must be called first")
+
+    def _expand_site(self) -> int:
+        """Head-chosen expansion site on the CURRENT buffer state.
+
+        Builds the placement distribution over the candidate splice sites
+        ``0..logical_len`` — the same competition
+        :func:`src.train_loop._placement_probs` scores: sanitized buffer ids
+        are embedded by ``policy.embed`` and scored by ``placement_head``
+        (which softmaxes its site logits internally). The chosen site is the
+        distribution's ``argmax``, resolved through the engine's own
+        deterministic tie-break (lowest index wins). Stochastic sampling of
+        the site is a documented future knob.
+
+        Called once per EXECUTED expansion, so multiple expansions within one
+        step each see the geometry left by their predecessors. Only rows
+        ``0..logical_len + 1`` are embedded — the phantom tail never enters.
+        """
+        import torch  # deferred: only the head-driven path needs tensors
+
+        view = [t if t >= PAD_ID else PAD_ID for t in self.buffer]
+        ids = torch.tensor(view[: self.logical_len + 1], dtype=torch.long)
+        h = self.policy.embed(ids)
+        probs = self.placement_head(h, self.logical_len)
+        return _argmax([float(p) for p in probs.detach().tolist()])
 
     def _action_rows(self) -> list[list[float]]:
         """Action-score rows from the policy, normalized to per-position rows.

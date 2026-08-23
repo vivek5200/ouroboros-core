@@ -24,9 +24,16 @@ Documented engine decisions locked in by these tests:
   rejects negative ids) plugs in directly; the true buffer is never mutated.
 """
 
+import os
+import tempfile
+import time
+
 import pytest
 import torch
 
+torch.set_num_threads(1)  # tiny tensors: single-threaded ops are faster here
+
+from src.curriculum_data import stage1_batch
 from src.diffusion import DiffusionStep, PhantomLoop
 from src.tokenizer import (
     IGNORE_ID,
@@ -37,6 +44,7 @@ from src.tokenizer import (
     tokenize,
 )
 from src.training import ACTION_DELETE, ACTION_EXPAND, ACTION_KEEP, PhantomPolicy
+from src.train_loop import PlacementHead, Trainer, expand_position_accuracy
 
 
 # ---------------------------------------------------------------------------
@@ -353,3 +361,209 @@ def test_result_returns_defensive_copy():
     buffer, _ = loop.result()
     buffer[0] = -12345
     assert loop.buffer[0] != -12345
+
+
+# ---------------------------------------------------------------------------
+# Placement-head integration: expansion sites come from the learned head
+# ---------------------------------------------------------------------------
+
+
+class ScriptedPlacementHead(PlacementHead):
+    """Deterministic head stand-in: fixed logits peaking on a scripted site.
+
+    ``site`` is either an absolute candidate-site index or a callable
+    ``(logical_len) -> site`` (enables the right-edge site
+    ``site == logical_len``). ``forward`` overrides the learned pipeline with
+    a one-hot softmax over the ``logical_len + 1`` candidate sites, and
+    ``calls`` counts consultations so tests can assert the loop really
+    consults the head.
+    """
+
+    def __init__(self, site):
+        super().__init__(d_model=8)  # width irrelevant: forward is overridden
+        self.site = site
+        self.calls = 0
+
+    def forward(self, h, logical_len):
+        self.calls += 1
+        chosen = self.site(logical_len) if callable(self.site) else self.site
+        assert 0 <= chosen <= logical_len, "scripted site outside candidates"
+        logits = torch.full((logical_len + 1,), -10.0)
+        logits[chosen] = 10.0  # strictly dominant mass on the scripted site
+        return torch.softmax(logits, dim=-1)
+
+
+class _EmbedStubPolicy(StubPolicy):
+    """:class:`StubPolicy` plus a throwaway ``embed``: the scripted head
+    overrides ``forward`` and never reads ``h``, but the engine still (by
+    contract) requires the policy to expose ``embed(ids)``."""
+
+    def embed(self, ids):
+        return torch.zeros(len(ids), 8)
+
+
+def test_placement_head_drives_expand_site_selection():
+    """With a placement_head attached, an EXPAND decision splices at the
+    head's argmax site — NOT at the masked position that chose EXPAND.
+    Scripted site 2 sits between the two seeded masks (1 and 3), so both
+    fresh boundaries must pile up AT site 2."""
+    policy = PhantomPolicy(vocab_size=64, d_model=8, n_actions=3, l_max=L_MAX)
+    head = ScriptedPlacementHead(site=2)
+    loop = PhantomLoop(
+        _EmbedStubPolicy(default=ACTION_EXPAND), placement_head=head
+    )
+    loop.start([10, MASK_ID, 20, MASK_ID, 30])
+    outcome = loop.step(max_expand=4)
+    assert outcome.action_counts == {"keep": 0, "expand": 2, "delete": 0}
+    assert outcome.logical_len_before == 5
+    assert outcome.logical_len_after == 7
+    assert head.calls == 2, "loop must consult the head per executed EXPAND"
+    buffer, _ = loop.result()
+    # Fresh MASKs spliced at candidate site 2 (never at the masked slots).
+    assert buffer[:7] == [10, MASK_ID, MASK_ID, MASK_ID, 20, MASK_ID, 30]
+
+
+def test_placement_head_may_choose_the_right_edge_site():
+    """Candidate sites are 0..logical_len INCLUSIVE: a scripted right-edge
+    choice must splice past the last live token (insert_masks contract)."""
+    policy = PhantomPolicy(vocab_size=64, d_model=8, n_actions=3, l_max=L_MAX)
+    head = ScriptedPlacementHead(site=lambda logical_len: logical_len)
+    loop = PhantomLoop(
+        _EmbedStubPolicy(script={1: ACTION_EXPAND}), placement_head=head
+    )
+    loop.start([10, MASK_ID, 20])
+    outcome = loop.step(max_expand=4)
+    assert outcome.action_counts["expand"] == 1
+    buffer, logical_len = loop.result()
+    assert logical_len == 4
+    assert buffer[:4] == [10, MASK_ID, 20, MASK_ID]  # appended at right edge
+
+
+def test_placement_head_keeps_keep_delete_on_action_logits():
+    """Only SITE selection moves to the head: DELETE decisions still come
+    from the policy's action rows and still act on the masked position."""
+    policy = PhantomPolicy(vocab_size=64, d_model=8, n_actions=3, l_max=L_MAX)
+    head = ScriptedPlacementHead(site=0)  # would hijack any expand to site 0
+    loop = PhantomLoop(
+        _EmbedStubPolicy(script={3: ACTION_DELETE}), placement_head=head
+    )
+    loop.start([10, MASK_ID, 20, MASK_ID, 30])
+    outcome = loop.step(max_expand=4)
+    assert outcome.action_counts == {"keep": 1, "expand": 0, "delete": 1}
+    assert head.calls == 0, "head is never consulted without an EXPAND"
+    buffer, logical_len = loop.result()
+    assert logical_len == 4
+    assert buffer[:4] == [10, MASK_ID, 20, 30]
+
+
+def test_placement_head_without_policy_embed_raises_typeerror():
+    """The head scores sites from embeddings: a policy without ``.embed``
+    cannot drive it, so wiring fails fast at construction."""
+
+    class NoEmbed:
+        def forward(self, token_ids, mask):
+            return [[0.0, 9.0, 0.0]] * len(token_ids)
+
+    with pytest.raises(TypeError):
+        PhantomLoop(NoEmbed(), placement_head=ScriptedPlacementHead(0))
+
+
+def test_trainer_save_all_load_all_round_trip_restores_identical_accuracy():
+    """Checkpoint completeness: save_all/load_all round-trip BOTH
+    policy.state_dict AND placement_head.state_dict — bit-identical weights
+    and therefore bit-identical placement accuracy after reload."""
+    torch.manual_seed(20240607)
+    policy = PhantomPolicy(vocab_size=64, d_model=32, n_actions=3, l_max=L_MAX)
+    head = PlacementHead(d_model=32, n_heads=4, n_layers=2)
+    trainer = Trainer(policy, lr=5e-3, seed=20240607, placement_head=head)
+    trainer.epoch(stage1_batch(32, seed0=6200), batch_size=8, epochs=1)
+    heldout = stage1_batch(6, seed0=6300)
+    before = [expand_position_accuracy(policy, i, head) for i in heldout]
+
+    fd, path = tempfile.mkstemp(suffix=".pt")
+    os.close(fd)
+    try:
+        trainer.save_all(path)
+        revived = Trainer.load_all(path)
+        after = [
+            expand_position_accuracy(revived.policy, i, revived.placement_head)
+            for i in heldout
+        ]
+    finally:
+        os.unlink(path)
+
+    assert revived.placement_head is not None
+    assert after == before  # bit-identical accuracy after round-trip
+    # BOTH state dicts rode along, tensor-for-tensor.
+    for key, tensor in policy.state_dict().items():
+        assert torch.equal(revived.policy.state_dict()[key], tensor)
+    for key, tensor in head.state_dict().items():
+        assert torch.equal(revived.placement_head.state_dict()[key], tensor)
+
+
+# ---------------------------------------------------------------------------
+# Learned smoke: brief training steers the loop's first EXPAND to the gap
+# ---------------------------------------------------------------------------
+
+
+class _ExpandAllAdapter:
+    """Forces the EXPAND action from every row while delegating embeddings.
+
+    Isolates what the integration adds — head-driven SITE selection — from
+    the (separately trained) action logits: every masked position decides
+    EXPAND, so each executed splice lands exactly where the head points.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def embed(self, ids):
+        return self.inner.embed(ids)
+
+    def forward(self, token_ids, mask):
+        return [[0.0, 9.0, 0.0]] * len(token_ids)
+
+
+def test_learned_head_steers_first_expand_toward_gap_start():
+    """~5 s of stage-1 training (24 instances x 100 epochs, observed ~4 s)
+    on the site-competition loss, then 8 held-out instances run through the
+    real loop (EXPAND forced, site chosen by the trained head): the first
+    executed EXPAND must land exactly on ``gap_start`` at least 2x the
+    uniform-site share (soft assertion). Pinned seeds make it
+    bit-reproducible; observed hit rate 4/8 vs threshold ~0.18."""
+    t0 = time.perf_counter()
+    torch.manual_seed(77)
+    policy = PhantomPolicy(vocab_size=64, d_model=32, n_actions=3, l_max=L_MAX)
+    head = PlacementHead(d_model=32, n_heads=4, n_layers=2)
+    Trainer(policy, lr=5e-3, seed=77, placement_head=head).epoch(
+        stage1_batch(24, seed0=6000), batch_size=8, epochs=100
+    )
+    train_seconds = time.perf_counter() - t0
+
+    instances = stage1_batch(8, seed0=6100)
+    hits = 0
+    uniform_share_sum = 0.0
+    for inst in instances:
+        loop = PhantomLoop(_ExpandAllAdapter(policy), vocab_size=64,
+                           placement_head=head)
+        seeded = list(inst["ids"]) + [MASK_ID]  # one placeholder to act on
+        loop.start(seeded)
+        pre, logical_len = loop.result()
+        assert logical_len == len(seeded)
+        outcome = loop.step(max_expand=1)
+        assert outcome is not None
+        assert outcome.action_counts["expand"] == 1
+        post, _ = loop.result()
+        site = next(
+            i for i in range(len(pre))
+            if post[i] == MASK_ID and pre[i] != MASK_ID
+        )
+        hits += int(site == inst["gap_start"])
+        uniform_share_sum += 1.0 / (len(inst["ids"]) + 1)
+
+    hit_rate = hits / len(instances)
+    chance = uniform_share_sum / len(instances)
+    assert hit_rate >= 2.0 * chance > 0.0, (
+        f"no learning signal: hit rate {hit_rate:.3f} vs uniform {chance:.3f}"
+    )
+    assert train_seconds < 30.0, f"smoke training too slow: {train_seconds:.1f}s"
