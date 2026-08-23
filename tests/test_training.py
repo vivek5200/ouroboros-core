@@ -28,7 +28,7 @@ from src.training import (
     PhantomPolicy,
     grpo_step,
 )
-from src.train_loop import Trainer, expand_position_accuracy
+from src.train_loop import PlacementHead, Trainer, expand_position_accuracy
 
 SEED = 20240607
 VOCAB = 64          # vocab_size <= 64 per scaffold budget
@@ -184,6 +184,7 @@ def test_zero_advantage_couples_produce_zero_param_change():
 # ---------------------------------------------------------------------------
 
 TRAIN_SEEDS = stage1_batch(n=128, seed0=2000)  # 128 training instances
+TRAIN_SEEDS_WIDE = stage1_batch(n=256, seed0=4000)  # 256 for the head proof
 HELDOUT = stage1_batch(n=20, seed0=9000)       # 20 held-out instances
 
 
@@ -207,8 +208,11 @@ def _stage1_policy(seed: int = SEED) -> PhantomPolicy:
     return PhantomPolicy(vocab_size=64, d_model=32, n_actions=3, l_max=L_MAX)
 
 
-def _mean_gap_accuracy(policy, dataset) -> float:
-    scores = [expand_position_accuracy(policy, inst) for inst in dataset]
+def _mean_gap_accuracy(policy, dataset, placement_head=None) -> float:
+    scores = [
+        expand_position_accuracy(policy, inst, placement_head)
+        for inst in dataset
+    ]
     return sum(scores) / len(scores)
 
 
@@ -229,20 +233,28 @@ def test_fresh_policy_starts_below_trained_level():
     assert fresh <= 0.5  # nowhere near certainty at init
 
 def test_training_lifts_gap_accuracy_on_heldout_instances():
-    """THE learning proof (robust form): paired before/after on the SAME
-    held-out instances must show an absolute lift > 0.01 in mean
-    P(EXPAND at gap_start). Observed lifts across configs/seeds:
-    +0.03 .. +0.10 — far above init-noise (±0.01). Runtime < 30 s.
+    """THE learning proof (raised bar): with the attention-based
+    PlacementHead attached, paired before/after on the SAME held-out
+    instances must show an absolute lift > 0.05 in mean P(placement at
+    gap_start). The legacy trigram readout saturates at ~0.15-0.16 (its total
+    lift was ~0.05-0.07 from a lower base) because it scores each candidate
+    site independently; the head's cross-site attention contrast expresses
+    "this site vs the OTHER sites" and clears the bar by a wide margin.
+    Observed with this exact config (256 instances x 6 epochs, lr 5e-3):
+    fresh ~0.08 -> post ~0.40, i.e. LIFT ~ +0.32. Runtime < 30 s.
     """
     t0 = time.perf_counter()
     policy = _stage1_policy()
-    fresh = _mean_gap_accuracy(policy, HELDOUT)
+    head = PlacementHead(d_model=policy.d_model, n_heads=4, n_layers=2)
+    fresh = _mean_gap_accuracy(policy, HELDOUT, head)
 
-    Trainer(policy, lr=5e-3, seed=SEED).epoch(TRAIN_SEEDS, batch_size=8, epochs=3)
+    Trainer(policy, lr=5e-3, seed=SEED, placement_head=head).epoch(
+        TRAIN_SEEDS_WIDE, batch_size=8, epochs=6
+    )
 
-    post = _mean_gap_accuracy(policy, HELDOUT)
+    post = _mean_gap_accuracy(policy, HELDOUT, head)
     elapsed = time.perf_counter() - t0
-    assert post - fresh > 0.01, (
+    assert post - fresh > 0.05, (
         f"no learning: fresh={fresh:.4f} vs post={post:.4f}"
     )
     assert elapsed < 30.0, f"learning proof too slow: {elapsed:.1f}s"
