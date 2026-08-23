@@ -145,12 +145,23 @@ def make_instance(seed: int) -> dict:
     flat: list[int] = [i for span in spans for i in span]
     assert flat == full_ids, "span attribution lost or duplicated tokens"
 
-    # Uniform choice among NON-FIRST statements (index 1 .. n_stmts-1):
-    # deleting statement 0 would leave no left context for the task.
+    # Stage-1 corruption: delete ONE random token from a NON-FIRST statement.
+    # A whole-statement deletion leaves no local anomaly (every splice site
+    # looks like every other statement boundary in trigram context — proven
+    # unlearnable beyond the ambiguity rate). A single-token deletion almost
+    # always breaks the local n-gram (e.g. "= +" or literal-literal adjacency),
+    # giving the trigram features something genuinely informative.
     victim = random.Random(seed ^ 0x5EED).randrange(1, n_stmts)
-    gap_start = sum(len(spans[k]) for k in range(victim))
-    gap_len = len(spans[victim])
-    ids = full_ids[:gap_start] + full_ids[gap_start + gap_len :]
+    pre_len = sum(len(spans[k]) for k in range(victim))
+    span = spans[victim]
+    if len(span) <= 2:                       # too small to punch a hole safely
+        gap_start, gap_len = pre_len, len(span)
+        ids = full_ids[:gap_start] + full_ids[gap_start + gap_len :]
+    else:
+        hole = random.Random(seed ^ 0xB055).randrange(1, len(span) - 1)
+        gap_start = pre_len + hole
+        gap_len = 1
+        ids = full_ids[:gap_start] + full_ids[gap_start + 1 :]
 
     return {
         "ids": ids,
