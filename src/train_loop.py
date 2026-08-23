@@ -241,9 +241,16 @@ class Trainer:
         m1, m2 = antithetic_pair(logical_len, rng)   # couple over live sites
 
         gen = torch.Generator(device="cpu").manual_seed(act_seed)
-        q_gap = logp[gap].detach().exp()             # side-shared distribution
-        a1 = int(torch.multinomial(q_gap, num_samples=1, generator=gen))
-        a2 = int(torch.multinomial(q_gap, num_samples=1, generator=gen))
+        # Exploration floor: sample from policy mixed with uniform. Pure-policy
+        # sampling collapses (both sides draw the same non-EXPAND action →
+        # advantage 0 → zero gradient → frozen policy). The 20% floor keeps
+        # every action in play so the gap signal never starves. Scaffold-level
+        # off-policy bias is accepted and documented.
+        with torch.no_grad():
+            base = torch.softmax(_position_logits(self.policy, ids)[gap], dim=-1)
+            mix = 0.8 * base + 0.2 / base.numel()
+        a1 = int(torch.multinomial(mix, num_samples=1, generator=gen))
+        a2 = int(torch.multinomial(mix, num_samples=1, generator=gen))
 
         # Fuzzy Proxy outcomes: a side scores (T,T,T) iff ITS sampled action
         # at the gap is EXPAND; compute_reward maps that to 1.0 vs 0.0.
