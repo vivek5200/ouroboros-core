@@ -84,7 +84,12 @@ import torch
 
 from src.grpo import antithetic_pair, coupled_reward
 from src.tokenizer import L_MAX, derive_mask, front_pack
-from src.training import ACTION_EXPAND, PhantomPolicy
+from src.training import (
+    ACTION_EXPAND,
+    DiffusionPolicy,
+    PhantomPolicy,
+    trigram_site_logits,
+)
 
 __all__ = [
     "PlacementHead",
@@ -92,11 +97,19 @@ __all__ = [
     "expand_position_accuracy",
 ]
 
+# Policies the trainer understands: anything with ``site_logits`` (both
+# built-ins do) or, as a legacy fallback, ``.embed``/``.head.weight``.
+Policy = PhantomPolicy | DiffusionPolicy
+
 
 def _position_logits(
-    policy: PhantomPolicy, ids: torch.Tensor, logical_len: int | None = None
+    policy: Policy, ids: torch.Tensor, logical_len: int | None = None
 ) -> torch.Tensor:
     """Per-position action logits ``(L, n_actions)`` from scaffold parameters.
+
+    Delegates to :func:`src.training.trigram_site_logits` — the single
+    source of truth shared with ``PhantomPolicy.site_logits``, so the two
+    agree bit-for-bit by construction.
 
     Boundary-safe neighbor context: position 0 lacks a left neighbor and the
     last slot lacks a right one; missing neighbors contribute zeros.
@@ -116,14 +129,23 @@ def _position_logits(
     Slots beyond ``logical_len`` (phantom tail) get raw context; callers
     must exclude them from placement competitions anyway.
     """
-    h = policy.embed(ids)          # (L, d)
-    ctx = h.clone()
-    ctx[1:] += h[:-1]              # left neighbor
-    ctx[:-1] += h[1:]              # right neighbor
-    if logical_len is not None:
-        mu = ctx[:logical_len].mean(dim=0, keepdim=True)
-        ctx = torch.cat([ctx[:logical_len] - mu, ctx[logical_len:]])
-    return torch.nn.functional.linear(ctx, policy.head.weight)  # (L, A)
+    return trigram_site_logits(policy, ids, logical_len)
+
+
+def _site_logits_or_legacy(
+    policy: Policy, ids: torch.Tensor, logical_len: int | None = None
+) -> torch.Tensor:
+    """Route per-position logits through ``site_logits`` when available.
+
+    New-generation policies (``DiffusionPolicy``) expose their own scoped
+    readout; policies without the method fall back to the legacy trigram
+    function. ``PhantomPolicy`` has the method but it delegates to the very
+    same shared code, so either path returns identical numbers for it.
+    """
+    site = getattr(policy, "site_logits", None)
+    if callable(site):
+        return site(ids, logical_len)
+    return _position_logits(policy, ids, logical_len)
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +281,7 @@ class PlacementHead(torch.nn.Module):
 
 
 def _placement_probs(
-    policy: PhantomPolicy,
+    policy: Policy,
     instance: dict,
     placement_head: "PlacementHead | None" = None,
 ) -> torch.Tensor:
@@ -270,7 +292,8 @@ def _placement_probs(
     real [EXPAND] can go, so it never competes for mass.
 
     With ``placement_head`` given, the distribution comes from the attention
-    head's site competition instead of the legacy per-position readout.
+    head's site competition instead of the per-position readout; otherwise
+    ``policy.site_logits`` (or the legacy trigram fallback) scores each site.
     """
     buffer, logical_len = front_pack(instance["ids"])
     ids = torch.tensor(buffer, dtype=torch.long)
@@ -280,15 +303,14 @@ def _placement_probs(
             f"[0, {policy.vocab_size})"
         )
     if placement_head is None:
-        probs = torch.softmax(
-            _position_logits(policy, ids, logical_len)[: logical_len + 1], dim=-1
-        )
+        logits = _site_logits_or_legacy(policy, ids, logical_len)
+        probs = torch.softmax(logits[: logical_len + 1], dim=-1)
         return probs[:, ACTION_EXPAND]                # (logical_len + 1,)
     return placement_head(policy.embed(ids), logical_len)  # (logical_len + 1,)
 
 
 def expand_position_accuracy(
-    policy: PhantomPolicy,
+    policy: Policy,
     instance: dict,
     placement_head: "PlacementHead | None" = None,
 ) -> float:
@@ -321,7 +343,7 @@ class Trainer:
 
     def __init__(
         self,
-        policy: PhantomPolicy,
+        policy: Policy,
         lr: float = 1e-3,
         seed: int = 0,
         placement_head: "PlacementHead | None" = None,
@@ -348,10 +370,24 @@ class Trainer:
         self.lr = lr
         self.seed = seed
         self.placement_head = placement_head
-        params = list(policy.parameters())
+        # Policies may bring their own optimizer structure (e.g.
+        # DiffusionPolicy's two-speed groups); a flat single-lr group — the
+        # historical layout, bit-identical for PhantomPolicy — is the
+        # fallback. An attached placement head always trains at full lr.
+        groups_factory = getattr(policy, "optimizer_param_groups", None)
+        if callable(groups_factory):
+            param_groups = [
+                dict(group) for group in groups_factory(self.lr)
+            ]
+        else:
+            param_groups = [
+                {"params": list(policy.parameters()), "lr": self.lr}
+            ]
         if placement_head is not None:
-            params += list(placement_head.parameters())
-        self.optimizer = torch.optim.Adam(params, lr=lr)
+            param_groups.append(
+                {"params": list(placement_head.parameters()), "lr": self.lr}
+            )
+        self.optimizer = torch.optim.Adam(param_groups, lr=self.lr)
 
     # ------------------------------------------------------------------
     # One epoch (= full passes over the dataset in batches)
@@ -443,7 +479,10 @@ class Trainer:
         ids = torch.tensor(buffer, dtype=torch.long)
         if self.placement_head is None:
             # Legacy: per-position action logits; only the gap row competes.
-            cand_logits = _position_logits(self.policy, ids)[gap]     # (A,)
+            # ``logical_len`` is deliberately NOT passed: the legacy couple
+            # readout never mean-subtracts, and ``PhantomPolicy.site_logits``
+            # with ``logical_len=None`` reproduces that behaviour exactly.
+            cand_logits = _site_logits_or_legacy(self.policy, ids)[gap]  # (A,)
             target = ACTION_EXPAND            # winning candidate = EXPAND action
         else:
             # Head: cross-site logits; the whole site set competes.
