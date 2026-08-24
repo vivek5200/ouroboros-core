@@ -27,7 +27,10 @@ Spec ambiguities resolved here (documented deliberately):
     overlapping regions raise ValueError. Empty spans list => L = 0.
 """
 
+import ast
 from bisect import bisect_right
+
+from src.tokenizer import _lexical_token_spans, _line_start_offsets
 
 GLOBAL = "global"
 LOCAL = "local"
@@ -249,3 +252,121 @@ def global_rows_frozen(mask_before, mask_after, spans_after) -> bool:
         return True
     except (TypeError, ValueError, IndexError):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Automatic tagging from real Python source (stdlib ast + tokenize)
+# ---------------------------------------------------------------------------
+
+_DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _local_body_intervals(tree: ast.Module, source: str) -> list[tuple[int, int]]:
+    """Half-open character interval covering each module-level def/class BODY.
+
+    For every ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` directly
+    under the module, the interval runs from the FIRST body statement's start
+    to the END of the physical line containing the LAST body statement's end.
+    Decorators and everything up to (and including) the header colon stay
+    outside, so they remain GLOBAL; extending to the line end keeps a
+    same-line trailing comment or ``; more`` attached to its body.
+    """
+    line_offsets, _eof = _line_start_offsets(source)
+    lines = source.splitlines()
+
+    def to_abs(lineno: int, col: int) -> int:
+        return line_offsets[lineno - 1] + col
+
+    intervals: list[tuple[int, int]] = []
+    for node in tree.body:  # module level only — nested defs inherit LOCAL
+        if not isinstance(node, _DEF_NODES):
+            continue
+        first = min(to_abs(s.lineno, s.col_offset) for s in node.body)
+        last = max(node.body, key=lambda s: (s.end_lineno, s.end_col_offset))
+        # Line-end extension swallows only same-line trailing content; it can
+        # never reach a later line, so sibling defs stay disjoint.
+        end = line_offsets[last.end_lineno - 1] + len(lines[last.end_lineno - 1])
+        intervals.append((first, max(first + 1, end)))
+    intervals.sort()
+    return intervals
+
+
+def auto_scope_spans(source: str) -> list[tuple[int, int, str]]:
+    """Derive the Module-4 GLOBAL/LOCAL span partition from real Python source.
+
+    Rationale (Paper Table 1): function bodies are LOCAL and signatures /
+    module-level statements are GLOBAL so that M[i,j] = 1 whenever a LOCAL
+    row reads a GLOBAL column — bodies see the signatures that define what
+    they call — while GLOBAL rows never see LOCAL columns, keeping the global
+    KV-cache insulated from local [EXPAND]/[DELETE] mutations, and sibling
+    LOCAL bodies stay mutually invisible (no cross-function bleed). This
+    function makes that partition automatic instead of hand-written in tests:
+    parse with stdlib ``ast``, walk top-level statements, and tag the lexical
+    token stream. A statement whose entire span is module-level is GLOBAL;
+    ``def`` / ``async def`` / ``class`` bodies are LOCAL — decorators, the
+    def/class header line and the signature up through the colon stay GLOBAL;
+    class bodies (methods included) are LOCAL; nested defs take the innermost
+    enclosing function's scope, i.e. LOCAL at any nesting depth.
+
+    Exact attribution rule: kept lexical tokens come from
+    ``tokenizer._lexical_token_spans`` (structural INDENT/DEDENT/NL/... noise
+    dropped), each carrying its absolute start offset. A token is attributed
+    like the tokenizer does — to its smallest enclosing statement — and its
+    scope is LOCAL iff that offset falls inside the *body block* of some
+    module-level def/class: the half-open character interval from the first
+    body statement's start to the end of the physical line holding the last
+    body statement. Because statement spans are disjoint, this is equivalent,
+    for code tokens, to tagging by smallest enclosing statement; comment
+    tokens belong to no AST statement, so body-interior/trailing ones land in
+    the body interval (LOCAL) while any other comment defaults to GLOBAL,
+    mirroring the tokenizer's root fallback. Consecutive equally-tagged runs
+    are merged into spans ``(start_token_idx, end_token_idx_exclusive,
+    scope)``, which cover ALL tokens exactly once.
+
+    Raises:
+        ValueError: If ``source`` is not parseable Python, or if the internal
+            partition invariant fails (never expected: construction covers
+            every token exactly once by design).
+    """
+    try:
+        tree = ast.parse(source)
+    except Exception as exc:
+        raise ValueError(f"source_code is not parseable Python: {exc}") from exc
+
+    tokens = _lexical_token_spans(source)
+    if not tokens:
+        return []  # empty / whitespace-only source => L = 0
+
+    intervals = _local_body_intervals(tree, source)
+    starts = [s for s, _ in intervals]
+    tags: list[str] = []
+    for _, offset in tokens:
+        idx = bisect_right(starts, offset) - 1
+        inside_body = idx >= 0 and offset < intervals[idx][1]
+        tags.append(LOCAL if inside_body else GLOBAL)
+
+    spans: list[tuple[int, int, str]] = []
+    for i, scope in enumerate(tags):
+        if spans and spans[-1][2] == scope:
+            s, _, _ = spans[-1]
+            spans[-1] = (s, i + 1, scope)
+        else:
+            spans.append((i, i + 1, scope))
+
+    ordered = _validated_sorted(spans)  # exact partition of [0, L) or ValueError
+    if ordered[-1][1] != len(tokens):
+        raise ValueError(
+            f"auto_scope_spans must cover all {len(tokens)} tokens exactly "
+            f"once, but its partition ends at {ordered[-1][1]}"
+        )
+    return spans
+
+
+def block_sparse_mask_for_source(source: str) -> list[list[bool]]:
+    """Convenience pipeline: source -> ``auto_scope_spans`` -> Table-1 mask.
+
+    Equivalent to ``block_sparse_mask(auto_scope_spans(source))``: the LxL
+    boolean mask over the lexical tokens of ``source`` under the automatic
+    GLOBAL/LOCAL partition, exactly as consumed downstream.
+    """
+    return block_sparse_mask(auto_scope_spans(source))
