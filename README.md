@@ -1,5 +1,7 @@
 # Ouroboros Core
 
+![tests](https://github.com/vivek5200/ouroboros-core/actions/workflows/tests.yml/badge.svg)
+
 Python/PyTorch diffusion engine for the Ouroboros v7.1 code refactoring system.
 
 ## Modules
